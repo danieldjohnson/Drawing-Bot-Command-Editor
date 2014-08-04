@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+<meta charset="UTF-8">
+
+<title>Whiteboard Drawing Bot Simulator and Generator</title>
+
+<script src="geometry.js"></script>
+<script src="adlparser.js"></script>
+<script src="shapeparser.js"></script>
+<script src="lib/Modernizr/modernizr-2.0.6.js"></script>
+<script src="lib/dat.gui.min.js"></script>
+<script src="lib/opentype.min.js"></script>
+<script src="lib/underscore-min.js"></script>
+<script src="shapegen.js"></script>
+<script src="cmdgen.js"></script>
+<script src="drawerInterpreter.js"></script>
+
+<script src="lib/codemirror-4.4/lib/codemirror.js"></script>
+<link rel="stylesheet" href="lib/codemirror-4.4/lib/codemirror.css">
+
+<script type="text/javascript">
+(function() {
+    var lastTime = 0;
+    var vendors = ['ms', 'moz', 'webkit', 'o'];
+    for(var x = 0; x < vendors.length && !window.requestAnimationFrame; ++x) {
+        window.requestAnimationFrame = window[vendors[x]+'RequestAnimationFrame'];
+        window.cancelRequestAnimationFrame = window[vendors[x]+
+          'CancelRequestAnimationFrame'];
+    }
+
+    if (!window.requestAnimationFrame)
+        window.requestAnimationFrame = function(callback, element) {
+            var currTime = new Date().getTime();
+            var timeToCall = Math.max(0, 16 - (currTime - lastTime));
+            var id = window.setTimeout(function() { callback(currTime + timeToCall); }, 
+              timeToCall);
+            lastTime = currTime + timeToCall;
+            return id;
+        };
+
+    if (!window.cancelAnimationFrame)
+        window.cancelAnimationFrame = function(id) {
+            clearTimeout(id);
+        };
+}());
+(function(){
+	function relMouseCoords(event){
+	    var totalOffsetX = 0;
+	    var totalOffsetY = 0;
+	    var canvasX = 0;
+	    var canvasY = 0;
+	    var currentElement = this;
+
+	    do{
+	        totalOffsetX += currentElement.offsetLeft - currentElement.scrollLeft;
+	        totalOffsetY += currentElement.offsetTop - currentElement.scrollTop;
+	    }
+	    while(currentElement = currentElement.offsetParent)
+
+	    canvasX = event.pageX - totalOffsetX;
+	    canvasY = event.pageY - totalOffsetY;
+
+	    return {x:canvasX, y:canvasY}
+	}
+	HTMLCanvasElement.prototype.relMouseCoords = relMouseCoords;
+}());
+var app;
+window.onload=function(){
+if(canvasSupport())
+	appInstance(document.getElementById("display"),document.getElementById("overdisplay"),document.getElementById("commandOutput"),document.getElementById("drawInput"),document.getElementById("drawMessage"));
+};
+function canvasSupport() {
+	return Modernizr.canvas;
+}
+
+
+
+function appInstance(myCanvas, topCanvas, commandOutput, drawInput, drawMessage){
+	var display=myCanvas;
+	var context=display.getContext("2d");
+	var topcontext=topCanvas.getContext("2d");
+	var dispWidth=display.width;
+	var dispHeight=display.height;
+
+	var cmdOutput = commandOutput;
+	cmdOutput.addEventListener("mouseup",function(){
+		cmdOutput.select();
+	});
+	var drawInputCM = CodeMirror.fromTextArea(drawInput, {
+		lineNumbers: true,
+	});
+
+	var drawObjects = [];
+	var drawSequence =  drawInputCM.getValue();
+	var lastSequence = window.localStorage.getItem('drawsequence');
+	if(lastSequence){
+		drawSequence=lastSequence;
+		drawInputCM.setValue(lastSequence);
+	}
+	var lastErrMark;
+	function reparse(){
+		if(!ready) return;
+		drawSequence = drawInputCM.getValue();
+		try{
+			drawObjects = ShapeGen.parse(drawSequence,fonts);
+			drawMessage.innerHTML = '';
+			drawMessage.className = '';
+			window.localStorage.setItem('drawsequence',drawSequence);
+			if(ready) restart();
+		}catch(e){
+			function showErr(msg){
+				drawMessage.innerHTML = msg;
+				drawMessage.className = 'error';
+			}
+			if(e instanceof ShapeParser.SyntaxError){
+				console.log(e);
+				showErr('<b>Error while parsing:</b> '+e.message);
+				var doc = drawInputCM.getDoc();
+				lastErrMark=doc.markText(
+					{ line:e.line-1, ch:e.column-1 },
+					{ line:e.line-1, ch:e.column },
+					{ className:'invalid' }
+				);
+			} else if(e instanceof TypeError && e.message == "Cannot read property 'forEachGlyph' of undefined"){
+				console.log(e);
+				showErr('<b>Error while parsing:</b> Could not find that font. Check the font list below.');
+			}else throw e;
+		}
+	}
+	var prepReparse = _.debounce(reparse,500);
+	drawInputCM.on("change",function(){
+		if(lastErrMark)
+			lastErrMark.clear();
+		prepReparse();
+	});
+
+
+	var timer;
+	var temp={};
+
+
+	var mouse = {x:0, y:0};
+
+	var params = {};
+	var pos = { x:dispWidth/2,
+					y:dispHeight/2 };
+	var TAU = 2*Math.PI;
+
+	var fonts;
+
+	var lastcmd;
+
+	params.r1 = 130;
+	params.r2 = 105;
+	params.steps = 513;
+	params.errorRate = 0;
+	params.penWidth = 3;
+	params.stroke = true;
+	params.fill = true;
+	params.fillInterval = 5;
+	params.draw = true;
+	params.speed = 100;
+	params.preview = true;
+	params.sizeToFit = true;
+
+	params = window.localStorage.getItem('params') ? JSON.parse(window.localStorage.getItem('params')) : params;
+
+	params.reset = function(){
+		window.localStorage.clear();
+		window.location.reload(false);
+	}
+
+  var gui = new dat.GUI();
+  gui.add(params, "r1", 0, Math.min(dispWidth,dispHeight)/2).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "r2", 0, Math.min(dispWidth,dispHeight)/2).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "steps", 1,1000).step(1).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "errorRate",0,1).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "penWidth",1,10).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "stroke").onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "fill").onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "fillInterval",1,10).step(1).onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "draw").onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "speed",1,1000);
+  gui.add(params, "preview").onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "sizeToFit").onChange(changeParams).onFinishChange(resumeAnimate);
+  gui.add(params, "reset");
+
+
+	var interpreter;
+
+	var ready=false;
+	var animating = true;
+	var resumeTimeout;
+	function changeParams(){
+		cmdgen = new ArmCommandGen(params.r1, params.r2, params.steps);
+		interpreter = new DrawerInterpreter(params.r1, params.r2, params.steps, pos, context,topcontext,topCanvas.width, topCanvas.height, params.errorRate, params.penWidth);
+		animating=false;
+
+		window.localStorage.setItem('params',JSON.stringify(params));
+
+		if(ready) restart();
+		window.clearTimeout(resumeTimeout);
+		resumeTimeout=window.setTimeout(resumeAnimate,1000);
+	}
+	function resumeAnimate(){
+		window.clearTimeout(resumeTimeout);
+		animating=true;
+		if(ready) restart();
+	}
+	changeParams();
+
+
+	start();
+	
+	////////////////////////////////
+	
+
+	
+	function start(){
+		
+
+
+		console.log("Starting...");
+		topCanvas.onclick=restart;
+		display.onclick=restart;
+
+		function loadFonts(fonturls, callback){
+			var ct = 0;
+			var length = Object.keys(fonturls).length;
+			var loadedfonts = {};
+			function getLoadCallback(fn){
+				return function(err,font){
+					if(err===null){
+						console.log("Loaded ",fn);
+						loadedfonts[fn] = font;
+						ct++;
+						if(ct==length){
+							callback(loadedfonts,null);
+						}
+					}else{
+						callback({},err);
+					}
+				}
+			}
+			for(key in fonturls){
+				var fontname = key,
+					fonturl = fonturls[key];
+				opentype.load(fonturl,getLoadCallback(fontname));
+			}
+		}
+		fonturls = {
+			'Arial Black' : 'fonts/Arial Black.ttf',
+			'Roboto' : 'fonts/Roboto/Roboto-Regular.ttf',
+			'Shadows Into Light' : 'fonts/Shadows_Into_Light/ShadowsIntoLight.ttf',
+			'Lobster' : 'fonts/Lobster/Lobster.ttf',
+			'Ubuntu' : 'fonts/Ubuntu/Ubuntu-Regular.ttf',
+			'Lily Script One' : 'fonts/Lily_Script_One/LilyScriptOne-Regular.ttf',
+			'Bubblegum Sans' : 'fonts/Bubblegum_Sans/BubblegumSans-Regular.ttf',
+			'Limelight' : 'fonts/Limelight/Limelight-Regular.ttf',
+			'Fontdiner Swanky' : 'fonts/Fontdiner_Swanky/FontdinerSwanky.ttf',
+			'Audiowide' : 'fonts/Audiowide/Audiowide-Regular.ttf',
+			'Playball' : 'fonts/Playball/Playball-Regular.ttf',
+			'Spirax' : 'fonts/Spirax/Spirax-Regular.ttf',
+			'Sancreek' : 'fonts/Sancreek/Sancreek-Regular.ttf',
+			'Poiret One' : 'fonts/Poiret_One/PoiretOne-Regular.ttf',
+			'Griffy' : 'fonts/Griffy/Griffy-Regular.ttf',
+			'Fugaz One' : 'fonts/Fugaz_One/FugazOne-Regular.ttf',
+			'Luckiest Guy' : 'fonts/Luckiest_Guy/LuckiestGuy.ttf',
+			'Slackey' : 'fonts/Slackey/Slackey.ttf',
+			'Unkempt' : 'fonts/Unkempt/Unkempt-Regular.ttf',
+			'Special Elite' : 'fonts/Special_Elite/SpecialElite.ttf',
+		}
+		//fonturl = ;
+		loadFonts(fonturls,function(lfonts,err){
+			if(err===null){
+				console.log("All fonts loaded.");
+				fonts=lfonts;
+				ready=true;
+				reparse();
+				restart();
+			}else{
+				throw new Exception(err);
+			}
+		});
+
+	}
+
+	function point(center, color, radius){
+		context.beginPath();
+      	context.arc(center.x, center.y, radius, 0, 2 * Math.PI, false);
+      	context.fillStyle = color;
+      	context.fill();
+	}
+	
+	function polyShape(shapes,color,w,shift){
+		if(!shift) shift={x:0,y:0};
+
+		context.lineWidth=w;
+		context.beginPath();
+		context.moveTo(shapes[0].x+shift.x,shapes[0].y+shift.y);
+		for (var i = 1; i < shapes.length; i++) {
+			if(Array.isArray(shapes[i])){
+				context.bezierCurveTo(shapes[i][0].x+shift.x,shapes[i][0].y+shift.y,shapes[i][1].x+shift.x,shapes[i][1].y+shift.y,shapes[i][2].x+shift.x,shapes[i][2].y+shift.y);
+			}else{
+				context.lineTo(shapes[i].x+shift.x, shapes[i].y+shift.y);
+			}
+		};
+		context.strokeStyle = color;
+      	context.stroke();
+	}
+	function showObjects(objs,color,w,shift){
+		for (var i = 0; i < objs.length; i++) {
+			var obj = objs[i];
+			for (var j = 0; j < obj.length; j++) {
+				var ps = obj[j];
+				polyShape(ps,color,w,shift);
+			};
+		};
+	}
+	
+	function drawBase(){
+		var r1=params.r1,
+			r2=params.r2,
+			steps=params.steps;
+
+		point(pos, 'black',3 );
+		for (var i = 0; i < steps; i++) {
+			var pos1 = {
+				x:pos.x + r1*Math.cos(i*TAU/steps),
+				y:pos.y + r1*Math.sin(i*TAU/steps)
+			};
+			point(pos1, 'green',3);
+			for (var j = 0; j < steps/2; j++) {
+				var pos2 = {
+					x:pos1.x + r2*Math.cos((i+j)*TAU/steps),
+					y:pos1.y + r2*Math.sin((i+j)*TAU/steps)
+				};
+				point(pos2, 'blue',0.5);
+			};
+		};
+	}
+	
+	var progress = 0;
+	var lastUpdate = performance.now();
+	function tick(){
+		updateRate = 1000 * 1/params.speed;
+		var now = performance.now();
+		var numTicks = Math.floor((now-lastUpdate) / updateRate);
+
+		lastUpdate=lastUpdate + numTicks*updateRate;
+
+		console.log("Tick");
+		var numAdv = params.draw&&animating ? numTicks : -1;
+		if(!interpreter.runQueue(numAdv)) return;
+
+		timer=window.requestAnimationFrame(tick);
+	}
+	function shift(pt,offs){
+		return {x:pt.x+offs.x, y:pt.y+offs.y};
+	}
+	function unshift(pt,offs){
+		return {x:pt.x-offs.x, y:pt.y-offs.y};
+	}
+	function shiftall(pts,offs){
+		var res=[];
+		for (var i = 0; i < pts.length; i++) {
+			res[i]=shift(pts[i],offs);
+		};
+		return res;
+	}
+	function unshiftall(pts,offs){
+		var res=[];
+		for (var i = 0; i < pts.length; i++) {
+			res[i]=unshift(pts[i],offs);
+		};
+		return res;
+	}
+	function restart(){
+		progress = 0;
+		context.clearRect(0,0,dispWidth,dispHeight);
+
+		var r1=params.r1,
+			r2=params.r2,
+			steps=params.steps;
+		if(steps<200)
+			drawBase();
+		point(pos, 'black',3 );
+
+		context.beginPath();
+      	context.arc(pos.x, pos.y, 3, 0, 2 * Math.PI, false);
+      	context.fillStyle = 'black';
+      	context.fill();
+
+
+      	context.strokeStyle = 'rgba(0,150,0,0.2)';
+      	context.lineWidth = 1;
+		context.beginPath();
+      	context.arc(pos.x, pos.y, params.r1+params.r2, 0, 2 * Math.PI, false);
+      	context.stroke();
+		context.beginPath();
+      	context.arc(pos.x, pos.y, Math.abs(params.r1-params.r2), 0, 2 * Math.PI, false);
+      	context.stroke();
+		
+		var objs = drawObjects;
+
+		if(params.sizeToFit){
+			objs = ShapeGen.constrain(objs, -160,10,320,210);
+			context.lineWidth=1;
+			context.strokeStyle="green";
+			context.save();
+			context.translate(pos.x,pos.y);
+			context.strokeRect(-160,0,320,220);
+			context.restore();
+		}
+
+
+
+		if(params.preview){
+			context.lineWidth=1;
+			context.strokeStyle="#ccc";
+			context.save();
+			context.translate(pos.x,pos.y);
+			ShapeGen.draw(objs,context);
+			context.restore();
+		}
+
+		var objpaths = cmdgen.generateObjectPaths(objs);
+		console.log(objpaths);
+
+		var cmd;
+		if(params.stroke){
+			if(params.fill){
+				cmd = cmdgen.fillAndStrokeObjects(objpaths,params.fillInterval);
+			}else{
+				cmd = cmdgen.strokeObjects(objpaths);
+			}
+		}else if(params.fill){
+			cmd = cmdgen.fillObjects(objpaths,params.fillInterval);
+		}else{
+			cmd = "";
+		}
+		cmdOutput.value = cmd+"R";
+
+		console.log(cmd);
+		interpreter.reset();
+		interpreter.clearQueue();
+		interpreter.enqueue(cmd);
+
+		lastcmd = cmd;
+
+
+		window.cancelAnimationFrame(timer);
+		timer=window.requestAnimationFrame(tick);
+	}
+	display.onmousemove=function(e){
+		mouse=display.relMouseCoords(e);
+
+	}
+}
+
+</script>
+
+<style type="text/css">
+	body {background-color:white; color:#449944;} 
+	h4 {font-family: sans-serif; color:#559955; font-size:16px;}
+	h3 {font-family: sans-serif; color:#559955;}
+	p {font-family: sans-serif; color:#559955; font-size:14px;}
+		#caption {text-align:center;}
+	a {font-family: sans-serif; color:#d15423; text-decoration:none;}
+	canvas {}
+		#display {position:absolute; top:10px; z-index:0;}
+		#overdisplay {position:absolute; top:10px; z-index:1;}
+	div {}
+		#container {width:900px; height:540px; margin:auto; padding-top:545px;}
+	#drawMessage {
+		margin-top:30px;
+	}
+	#drawMessage.error {
+		color:red;
+		border-radius:10px;
+		padding:10px;
+		border:1px solid red;
+	}
+
+	.CodeMirror {
+		margin:20px;
+		border: 1px solid black;
+		border-left:none;
+	}
+	.CodeMirror .invalid{
+		color:red;
+		font-weight:bold;
+	}
+
+	pre#cmdref {
+		color:black;
+		font-weight:bold;
+		white-space: pre-wrap;       /* css-3 */
+		 white-space: -moz-pre-wrap;  /* Mozilla, since 1999 */
+		 white-space: -pre-wrap;      /* Opera 4-6 */
+		 white-space: -o-pre-wrap;    /* Opera 7 */
+		 word-wrap: break-word;       /* Internet Explorer 5.5+ */
+	}
+	pre#cmdref b{
+		color:green;
+	}
+	pre#cmdref i{
+		color:green;
+	}
+	pre#cmdref .desc{
+		font-style:italic;
+		font-weight:normal;
+	}
+
+</style>
+
+</head>
+<body>
+<div id="container"> 
+    <canvas id="display" width="900px" height="540px">
+        Your browser does not support HTML5 canvas.
+    </canvas>
+    <canvas id="overdisplay" width="900px" height="540px">
+        Your browser does not support HTML5 canvas.
+    </canvas>
+    <p id="caption">
+        Click to Restart
+    </p>
+    
+    <form >
+    	<label for="commandOutput">Raw output:</label>
+    	<input name="cmd" type="text" id="commandOutput" readonly="true" placeholder="Command will appear here">
+	</form>
+    <div id="drawMessage"></div>
+    <textarea id="drawInput">
+complex{
+	rect[0,100,100,100]
+	rotate[45,50,150]{ 
+		~rect[20,120,60,60]
+	}
+}</textarea>
+<h3>Commands you can enter:</h3>
+<pre id="cmdref">
+<b>Simple commands</b>
+
+rect[<i>x</i>,<i>y</i>,<i>width</i>,<i>height</i>] <span class="desc">creates a rectangle at (x,y) with specified width and height.</span>
+circle[<i>x</i>,<i>y</i>,<i>radius</i>] <span class="desc">creates a circle at (x,y) of specified radius.</span>
+
+line[<i>x1</i>,<i>y1</i>,<i>x2</i>,<i>y2</i>] <span class="desc">creates a line between two points.</span>
+curve[<i>x1</i>,<i>y1</i>,<i>x2</i>,<i>y2</i>,<i>x3</i>,<i>y3</i>] <span class="desc">creates a Bezier curve between the first point and the last point. Curve approaches but does not go through middle point.</span>
+curve[<i>x1</i>,<i>y1</i>,<i>x2</i>,<i>y2</i>,<i>x3</i>,<i>y3</i>,<i>x4</i>,<i>y4</i>] <span class="desc">creates a Bezier curve between the first point and the last point. Curve approaches but does not go through middle two points.</span>
+
+path[(<i>x</i>,<i>y</i>),(<i>x</i>,<i>y</i>),&lt;<i>x</i>,<i>y</i>&gt;,(<i>x</i>,<i>y</i>),&lt;<i>x</i>,<i>y</i>&gt;,&lt;<i>x</i>,<i>y</i>&gt;,(<i>x</i>,<i>y</i>), <i>...</i> ] <span class="desc">creates a path that goes through the points surrounded by parentheses and curves toward control points in triangle brackets. Paths must have at least 2 points, and points can have up to two control points between adjacent points. To fill a path, the path must be oriented counterclockwise and end at its starting point.</span>
+text["<i>string</i>", <i>x</i>,<i>y</i>, <i>size</i>, "<i>fontname</i>""] <span class="desc">writes the string at the specified point at the specified size. Avaliable fonts can be found below. Quotes can be escaped by writing <i>\"</i>, which will be replaced with a proper quote mark. Backslashes can be escaped with <i>\\</i>.</span>
+
+<b>Manipulations and grouping</b>
+
+complex{ <i>...</i> } <span class="desc">joins a set of paths or shapes into a single object. Paths in a single object cannot intersect each other, and if one path is inside another, the inner one must be reversed so that it forms a hole.</span>
+~<i>cmd</i> <span class="desc">or</span> reverse{ <i>...</i> } <span class="desc">reverses the specified command. This turns a normal (counterclockwise) shape into a (clockwise) hole. Should only appear within a complex wrapper.</span>
+
+<b>Transformations</b>
+
+translate[<i>dx</i>,<i>dy</i>]{ <i>...</i> } <span class="desc">shifts the enclosed commands by the specified amounts.</span>
+rotate[<i>angle</i>]{ <i>...</i> } <span class="desc">rotates the enclosed commands around the origin by the specified degree measure.</span>
+rotate[<i>angle</i>, <i>x</i>,<i>y</i>]{ <i>...</i> } <span class="desc">rotates the enclosed commands around the specified point by the specified degree measure.</span>
+scale[<i>factor</i>]{ <i>...</i> } <span class="desc">scales the enclosed commands by the given scale factor (less than one means shrink, greater means enlarge)</span>
+
+constrain[<i>x</i>,<i>y</i>,<i>w</i>,<i>h</i>]{ <i>...</i> } <span class="desc">constrains the enclosed commands to lie within the given rectangle. It will translate or scale them if necessary, but will have no effect if they are entirely enclosed in the rectangle.</span>
+</pre>
+<h3>Available fonts:</h3>
+<ul>
+<li>Arial Black</li>
+<li>Roboto</li>
+<li>Shadows Into Light</li>
+<li>Lobster</li>
+<li>Ubuntu</li>
+<li>Lily Script One</li>
+<li>Bubblegum Sans</li>
+<li>Limelight</li>
+<li>Fontdiner Swanky</li>
+<li>Audiowide</li>
+<li>Playball</li>
+<li>Spirax</li>
+<li>Sancreek</li>
+<li>Poiret One</li>
+<li>Griffy</li>
+<li>Fugaz One</li>
+<li>Luckiest Guy</li>
+<li>Slackey</li>
+<li>Unkempt</li>
+<li>Special Elite</li>
+</ul>
+</div>
+</body>
+</html>
